@@ -20,9 +20,10 @@ Notes:
 """
 from __future__ import annotations
 import argparse
+import json
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from pygltflib import (
     GLTF2,
@@ -350,6 +351,189 @@ def summarize_extensions(ctx: Ctx) -> str:
     return f"Extensions: used=[{used}], required=[{reqd}]"
 
 
+def build_json_data(gltf: GLTF2, max_depth: int) -> Dict[str, Any]:
+    """Build a JSON-serializable dictionary with all glTF data."""
+    ctx = Ctx(gltf=gltf, node_name={})
+
+    # File info
+    file_info = {
+        "generator": getattr(gltf.asset, 'generator', None),
+        "version": getattr(gltf.asset, 'version', None),
+    }
+
+    # Extensions
+    extensions = {
+        "used": gltf.extensionsUsed or [],
+        "required": gltf.extensionsRequired or [],
+    }
+
+    # Scenes
+    scenes = []
+    for si, scene in enumerate(gltf.scenes or []):
+        scenes.append({
+            "index": si,
+            "name": scene.name,
+            "root_nodes": scene.nodes or [],
+        })
+
+    # Nodes
+    nodes = []
+    for ni, n in enumerate(gltf.nodes or []):
+        node_data = {
+            "index": ni,
+            "name": n.name,
+            "mesh": n.mesh,
+            "skin": n.skin,
+            "camera": n.camera,
+            "children": n.children or [],
+        }
+        if n.matrix:
+            node_data["matrix"] = list(n.matrix)
+        if n.translation:
+            node_data["translation"] = list(n.translation)
+        if n.rotation:
+            node_data["rotation"] = list(n.rotation)
+        if n.scale:
+            node_data["scale"] = list(n.scale)
+        nodes.append(node_data)
+
+    # Meshes
+    meshes = []
+    for mi, m in enumerate(gltf.meshes):
+        primitives = []
+        for pi, prim in enumerate(m.primitives):
+            attrs = {}
+            if prim.attributes:
+                for k, v in vars(prim.attributes).items():
+                    if v is not None:
+                        attrs[k] = v
+
+            prim_data = {
+                "index": pi,
+                "mode": PRIM_MODES.get(getattr(prim, "mode", 4) or 4, "UNKNOWN"),
+                "attributes": attrs,
+                "material": prim.material,
+                "indices": prim.indices,
+                "vertices": primitive_vertex_count(gltf, prim),
+                "triangles": primitive_triangle_count(gltf, prim),
+                "morph_targets": len(prim.targets) if prim.targets else 0,
+            }
+            primitives.append(prim_data)
+
+        meshes.append({
+            "index": mi,
+            "name": m.name,
+            "primitives": primitives,
+        })
+
+    # Materials
+    materials = []
+    for i, m in enumerate(gltf.materials or []):
+        mat_data = {
+            "index": i,
+            "name": m.name,
+            "alphaMode": getattr(m, "alphaMode", None),
+            "doubleSided": getattr(m, "doubleSided", False),
+        }
+        if m.pbrMetallicRoughness:
+            pbr = m.pbrMetallicRoughness
+            pbr_data = {}
+            if pbr.baseColorFactor is not None:
+                pbr_data["baseColorFactor"] = list(pbr.baseColorFactor)
+            if pbr.metallicFactor is not None:
+                pbr_data["metallicFactor"] = pbr.metallicFactor
+            if pbr.roughnessFactor is not None:
+                pbr_data["roughnessFactor"] = pbr.roughnessFactor
+            if pbr.baseColorTexture is not None and pbr.baseColorTexture.index is not None:
+                pbr_data["baseColorTexture"] = pbr.baseColorTexture.index
+            if pbr.metallicRoughnessTexture is not None and pbr.metallicRoughnessTexture.index is not None:
+                pbr_data["metallicRoughnessTexture"] = pbr.metallicRoughnessTexture.index
+            mat_data["pbrMetallicRoughness"] = pbr_data
+        materials.append(mat_data)
+
+    # Textures
+    textures = []
+    for ti, t in enumerate(gltf.textures or []):
+        textures.append({
+            "index": ti,
+            "source": t.source,
+            "sampler": t.sampler,
+        })
+
+    # Images
+    images = []
+    for ii, img in enumerate(gltf.images or []):
+        images.append({
+            "index": ii,
+            "uri": img.uri,
+            "mimeType": img.mimeType,
+            "bufferView": img.bufferView,
+        })
+
+    # Skins (skeletons)
+    skins = []
+    for si, s in enumerate(gltf.skins or []):
+        skins.append({
+            "index": si,
+            "name": s.name,
+            "skeleton": s.skeleton,
+            "joints": s.joints or [],
+            "inverseBindMatrices": s.inverseBindMatrices,
+        })
+
+    # Animations
+    animations = []
+    for ai, a in enumerate(gltf.animations or []):
+        channels = []
+        for ci, ch in enumerate(a.channels or []):
+            tgt = ch.target
+            channels.append({
+                "index": ci,
+                "sampler": ch.sampler,
+                "target": {
+                    "node": tgt.node if tgt else None,
+                    "path": tgt.path if tgt and tgt.path else None,
+                }
+            })
+
+        samplers = []
+        durations = []
+        for si, samp in enumerate(a.samplers or []):
+            tmax = sampler_input_max_time(gltf, idx_or_none(samp.input))
+            if tmax is not None:
+                durations.append(tmax)
+            samplers.append({
+                "index": si,
+                "input": samp.input,
+                "output": samp.output,
+                "interpolation": samp.interpolation,
+                "input_count": accessor_len(gltf, idx_or_none(samp.input)),
+                "output_count": accessor_len(gltf, idx_or_none(samp.output)),
+            })
+
+        animations.append({
+            "index": ai,
+            "name": a.name,
+            "channels": channels,
+            "samplers": samplers,
+            "duration": max(durations) if durations else None,
+        })
+
+    return {
+        "file": file_info,
+        "extensions": extensions,
+        "scenes": scenes,
+        "nodes": nodes,
+        "meshes": meshes,
+        "materials": materials,
+        "textures": textures,
+        "images": images,
+        "skins": skins,
+        "skeleton": skins,  # Alias for skins to support '| jq -r .skeleton'
+        "animations": animations,
+    }
+
+
 def build_report(gltf: GLTF2, markdown: bool, max_depth: int) -> str:
     ctx = Ctx(gltf=gltf, node_name={})
 
@@ -393,6 +577,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("input", help="Path to .glb or .gltf")
     p.add_argument("-o", "--output", help="Write report to this file (otherwise prints to stdout)")
     p.add_argument("--markdown", action="store_true", help="Emit Markdown instead of plain text")
+    p.add_argument("--json", action="store_true", help="Emit JSON instead of text (use with jq: '| jq .animations')")
     p.add_argument("--max-depth", type=int, default=3, help="Max depth when printing node hierarchy (default: 3)")
     p.add_argument("--verbose", action="store_true", help="Print extra info to stderr")
     args = p.parse_args(argv)
@@ -403,15 +588,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write(f"Loaded {args.input}: scenes={len(gltf.scenes or [])}, nodes={len(gltf.nodes or [])}, "
                          f"meshes={len(gltf.meshes or [])}, skins={len(gltf.skins or [])}, animations={len(gltf.animations or [])}\n")
 
-    report = build_report(gltf, markdown=args.markdown, max_depth=args.max_depth)
+    if args.json:
+        data = build_json_data(gltf, max_depth=args.max_depth)
+        output = json.dumps(data, indent=2)
+    else:
+        output = build_report(gltf, markdown=args.markdown, max_depth=args.max_depth)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report)
+            f.write(output)
         if args.verbose:
             sys.stderr.write(f"Wrote {args.output}\n")
     else:
-        print(report)
+        print(output)
 
     return 0
 
