@@ -487,11 +487,19 @@ def build_json_data(gltf: GLTF2, max_depth: int) -> Dict[str, Any]:
         channels = []
         for ci, ch in enumerate(a.channels or []):
             tgt = ch.target
+            node_idx = tgt.node if tgt else None
+            samp_idx = ch.sampler
+            samp = a.samplers[idx_or_none(samp_idx)] if samp_idx is not None and a.samplers else None
+
             channels.append({
                 "index": ci,
-                "sampler": ch.sampler,
+                "sampler": samp_idx,
+                "interpolation": samp.interpolation if samp and samp.interpolation else "LINEAR",
+                "keys": accessor_len(gltf, idx_or_none(samp.input)) if samp else None,
+                "values": accessor_len(gltf, idx_or_none(samp.output)) if samp else None,
                 "target": {
-                    "node": tgt.node if tgt else None,
+                    "node": node_idx,
+                    "node_name": node_name_by_index(gltf, idx_or_none(node_idx)),
                     "path": tgt.path if tgt and tgt.path else None,
                 }
             })
