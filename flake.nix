@@ -14,7 +14,7 @@
           pkgs.python3.withPackages (ps: with ps; [ pygltflib ]);
 
         appName = "glb2text";
-        appVersion = "0.1.1";
+        appVersion = "0.1.2";
       in {
         packages = {
           glb2text = pkgs.stdenv.mkDerivation {

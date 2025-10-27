@@ -218,7 +218,7 @@ def summarize_meshes(ctx: Ctx) -> str:
         return "\n".join(lines)
     for mi, m in enumerate(gltf.meshes):
         mname = safe_name(m.name, f"mesh[{mi}]")
-        lines.append(f"  - {mname} (primitives: {len(m.primitives)})")
+        lines.append(f"  - {mname} (primitives/material slots: {len(m.primitives)})")
         for pi, prim in enumerate(m.primitives):
             mode = PRIM_MODES.get(getattr(prim, "mode", 4) or 4, "UNKNOWN")
             # prim.attributes is an Attributes object, convert to dict to get keys
@@ -229,15 +229,41 @@ def summarize_meshes(ctx: Ctx) -> str:
                 attrs = "<none>"
             v = primitive_vertex_count(gltf, prim)
             t = primitive_triangle_count(gltf, prim)
-            mat = material_name(gltf, idx_or_none(prim.material))
+            mat_idx = idx_or_none(prim.material)
+            mat = material_name(gltf, mat_idx)
             morphs = len(prim.targets) if prim.targets else 0
+            # Show material slot clearly
+            mat_slot = f"slot[{pi}] -> material[{mat_idx}] ({mat})" if mat_idx is not None else f"slot[{pi}] -> <no material>"
             lines.append(
                 indent(
-                    f"[{pi}] mode={mode}, material={mat}, vertices={v if v is not None else '?'}, "
+                    f"[{pi}] mode={mode}, {mat_slot}, vertices={v if v is not None else '?'}, "
                     f"triangles={t if t is not None else '?'}, attributes=[{attrs}], morphTargets={morphs}",
                     6,
                 )
             )
+    return "\n".join(lines)
+
+
+def summarize_material_slots(ctx: Ctx) -> str:
+    """Quick reference showing which material slots (primitives) use which materials."""
+    gltf = ctx.gltf
+    lines = ["Material Slot Reference:"]
+    if not gltf.meshes:
+        lines.append("  <none>")
+        return "\n".join(lines)
+
+    for mi, m in enumerate(gltf.meshes):
+        mname = safe_name(m.name, f"mesh[{mi}]")
+        if not m.primitives:
+            continue
+        lines.append(f"  {mname}:")
+        for pi, prim in enumerate(m.primitives):
+            mat_idx = idx_or_none(prim.material)
+            mat = material_name(gltf, mat_idx)
+            if mat_idx is not None:
+                lines.append(indent(f"Surface {pi}: material[{mat_idx}] = {mat}", 4))
+            else:
+                lines.append(indent(f"Surface {pi}: <no material>", 4))
     return "\n".join(lines)
 
 
@@ -251,8 +277,41 @@ def summarize_materials(ctx: Ctx) -> str:
         name = safe_name(m.name, f"material[{i}]")
         pbr = pbr_summary(m.pbrMetallicRoughness)
         alpha = getattr(m, "alphaMode", None)
+        alpha_cutoff = getattr(m, "alphaCutoff", None)
         dbl = getattr(m, "doubleSided", False)
-        lines.append(f"  - {name} | alpha={alpha}, doubleSided={dbl}{', ' + pbr if pbr else ''}")
+        emissive = getattr(m, "emissiveFactor", None)
+
+        # Build main line
+        main = f"  - {name} | alpha={alpha}"
+        if alpha_cutoff is not None:
+            main += f" (cutoff={alpha_cutoff})"
+        main += f", doubleSided={dbl}"
+        if emissive and any(e > 0 for e in emissive):
+            main += f", emissive={tuple(emissive)}"
+        if pbr:
+            main += f", {pbr}"
+        lines.append(main)
+
+        # Additional material properties
+        details = []
+        if hasattr(m, "normalTexture") and m.normalTexture is not None:
+            scale = getattr(m.normalTexture, "scale", 1.0)
+            details.append(f"normalMap=texture[{m.normalTexture.index}] (scale={scale})")
+        if hasattr(m, "occlusionTexture") and m.occlusionTexture is not None:
+            strength = getattr(m.occlusionTexture, "strength", 1.0)
+            details.append(f"occlusionMap=texture[{m.occlusionTexture.index}] (strength={strength})")
+        if hasattr(m, "emissiveTexture") and m.emissiveTexture is not None:
+            details.append(f"emissiveMap=texture[{m.emissiveTexture.index}]")
+
+        # Extensions
+        if hasattr(m, "extensions") and m.extensions:
+            ext_names = ", ".join(m.extensions.keys())
+            details.append(f"extensions=[{ext_names}]")
+
+        # Print details on separate indented lines
+        for detail in details:
+            lines.append(indent(f"• {detail}", 4))
+
     return "\n".join(lines)
 
 
@@ -410,6 +469,7 @@ def build_json_data(gltf: GLTF2, max_depth: int) -> Dict[str, Any]:
 
             prim_data = {
                 "index": pi,
+                "material_slot": pi,
                 "mode": PRIM_MODES.get(getattr(prim, "mode", 4) or 4, "UNKNOWN"),
                 "attributes": attrs,
                 "material": prim.material,
@@ -433,8 +493,16 @@ def build_json_data(gltf: GLTF2, max_depth: int) -> Dict[str, Any]:
             "index": i,
             "name": m.name,
             "alphaMode": getattr(m, "alphaMode", None),
+            "alphaCutoff": getattr(m, "alphaCutoff", None),
             "doubleSided": getattr(m, "doubleSided", False),
         }
+
+        # Emissive properties
+        emissive = getattr(m, "emissiveFactor", None)
+        if emissive:
+            mat_data["emissiveFactor"] = list(emissive)
+
+        # PBR properties
         if m.pbrMetallicRoughness:
             pbr = m.pbrMetallicRoughness
             pbr_data = {}
@@ -449,6 +517,25 @@ def build_json_data(gltf: GLTF2, max_depth: int) -> Dict[str, Any]:
             if pbr.metallicRoughnessTexture is not None and pbr.metallicRoughnessTexture.index is not None:
                 pbr_data["metallicRoughnessTexture"] = pbr.metallicRoughnessTexture.index
             mat_data["pbrMetallicRoughness"] = pbr_data
+
+        # Normal, occlusion, and emissive textures
+        if hasattr(m, "normalTexture") and m.normalTexture is not None:
+            mat_data["normalTexture"] = {
+                "index": m.normalTexture.index,
+                "scale": getattr(m.normalTexture, "scale", 1.0),
+            }
+        if hasattr(m, "occlusionTexture") and m.occlusionTexture is not None:
+            mat_data["occlusionTexture"] = {
+                "index": m.occlusionTexture.index,
+                "strength": getattr(m.occlusionTexture, "strength", 1.0),
+            }
+        if hasattr(m, "emissiveTexture") and m.emissiveTexture is not None:
+            mat_data["emissiveTexture"] = {"index": m.emissiveTexture.index}
+
+        # Extensions
+        if hasattr(m, "extensions") and m.extensions:
+            mat_data["extensions"] = list(m.extensions.keys())
+
         materials.append(mat_data)
 
     # Textures
@@ -554,6 +641,7 @@ def build_report(gltf: GLTF2, markdown: bool, max_depth: int) -> str:
         ("Scenes", [summarize_scenes(ctx)]),
         ("Hierarchy", [summarize_hierarchy(ctx, max_depth=max_depth)]),
         ("Meshes", [summarize_meshes(ctx)]),
+        ("Material Slots", [summarize_material_slots(ctx)]),
         ("Materials", [summarize_materials(ctx)]),
         ("Textures & Images", [summarize_textures_images(ctx)]),
         ("Skins", [summarize_skins(ctx)]),
